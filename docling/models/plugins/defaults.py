@@ -5,6 +5,7 @@ from docling.models.picture_description_vlm_model import PictureDescriptionVlmMo
 from docling.models.rapid_ocr_model import RapidOcrModel
 from docling.models.tesseract_ocr_cli_model import TesseractOcrCliModel
 from docling.models.tesseract_ocr_model import TesseractOcrModel
+from docling.models.google_vision_ocr_model import GoogleVisionOcrModel
 
 
 def ocr_engines():
@@ -15,6 +16,7 @@ def ocr_engines():
             RapidOcrModel,
             TesseractOcrModel,
             TesseractOcrCliModel,
+            GoogleVisionOcrModel,
         ]
     }
 

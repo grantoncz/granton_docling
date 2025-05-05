@@ -194,6 +194,20 @@ class TesseractOcrOptions(OcrOptions):
     model_config = ConfigDict(
         extra="forbid",
     )
+    
+class GoogleVisionOcrOptions(OcrOptions):
+    """Options for the GoogleVision engine."""
+
+    kind: ClassVar[Literal["googlevisionocr"]] = "googlevisionocr"
+    lang: List[str] = ["fra", "deu", "spa", "eng", "cze"]
+    path: Optional[str] = None
+    
+    credentials : dict = None
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+
 
 
 class OcrMacOptions(OcrOptions):
@@ -213,8 +227,8 @@ class PictureDescriptionBaseOptions(BaseOptions):
     batch_size: int = 8
     scale: float = 2
 
-    picture_area_threshold: float = (
-        0.05  # percentage of the area for a picture to processed with the models
+    bitmap_area_threshold: float = (
+        0.2  # percentage of the area for a bitmap to processed with the models
     )
 
 
@@ -266,7 +280,6 @@ class ResponseFormat(str, Enum):
 class InferenceFramework(str, Enum):
     MLX = "mlx"
     TRANSFORMERS = "transformers"
-    OPENAI = "openai"
 
 
 class HuggingFaceVlmOptions(BaseVlmOptions):
@@ -283,19 +296,6 @@ class HuggingFaceVlmOptions(BaseVlmOptions):
     @property
     def repo_cache_folder(self) -> str:
         return self.repo_id.replace("/", "--")
-
-
-class ApiVlmOptions(BaseVlmOptions):
-    kind: Literal["api_model_options"] = "api_model_options"
-
-    url: AnyUrl = AnyUrl(
-        "http://localhost:11434/v1/chat/completions"
-    )  # Default to ollama
-    headers: Dict[str, str] = {}
-    params: Dict[str, Any] = {}
-    scale: float = 2.0
-    timeout: float = 60
-    response_format: ResponseFormat
 
 
 smoldocling_vlm_mlx_conversion_options = HuggingFaceVlmOptions(
@@ -321,20 +321,10 @@ granite_vision_vlm_conversion_options = HuggingFaceVlmOptions(
     inference_framework=InferenceFramework.TRANSFORMERS,
 )
 
-granite_vision_vlm_ollama_conversion_options = ApiVlmOptions(
-    url=AnyUrl("http://localhost:11434/v1/chat/completions"),
-    params={"model": "granite3.2-vision:2b"},
-    prompt="OCR the full page to markdown.",
-    scale=1.0,
-    timeout=120,
-    response_format=ResponseFormat.MARKDOWN,
-)
-
 
 class VlmModelType(str, Enum):
     SMOLDOCLING = "smoldocling"
     GRANITE_VISION = "granite_vision"
-    GRANITE_VISION_OLLAMA = "granite_vision_ollama"
 
 
 # Define an enum for the backend options
@@ -380,14 +370,13 @@ class PaginatedPipelineOptions(PipelineOptions):
 
 
 class VlmPipelineOptions(PaginatedPipelineOptions):
+
     generate_page_images: bool = True
     force_backend_text: bool = (
         False  # (To be used with vlms, or other generative models)
     )
     # If True, text from backend will be used instead of generated text
-    vlm_options: Union[HuggingFaceVlmOptions, ApiVlmOptions] = (
-        smoldocling_vlm_conversion_options
-    )
+    vlm_options: Union[HuggingFaceVlmOptions] = smoldocling_vlm_conversion_options
 
 
 class PdfPipelineOptions(PaginatedPipelineOptions):
