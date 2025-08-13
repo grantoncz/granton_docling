@@ -2,16 +2,16 @@ import logging
 from pathlib import Path
 from typing import Iterable, Optional, Type
 
-from docling_core.types.doc import BoundingBox, CoordOrigin
+from docling_core.types.doc.base import BoundingBox, CoordOrigin
 from docling_core.types.doc.page import BoundingRectangle, TextCell
 
 from docling.datamodel.base_models import Page
 from docling.datamodel.document import ConversionResult
 from docling.datamodel.pipeline_options import (
-    AcceleratorOptions,
     OcrOptions,
     GoogleVisionOcrOptions,
 )
+from docling.datamodel.accelerator_options import AcceleratorOptions, AcceleratorDevice
 from docling.datamodel.settings import settings
 from docling.models.base_ocr_model import BaseOcrModel
 from docling.utils.profiling import TimeRecorder
@@ -100,7 +100,7 @@ class GoogleVisionOcrModel(BaseOcrModel):
                         image_bytes = buf.getvalue()
 
                         vision_image = vision.Image(content=image_bytes)
-                        response = self.reader.text_detection(image=vision_image)
+                        response = self.reader.document_text_detection(image=vision_image)
 
                         annotations = response.text_annotations[1:]  # skip full block
                         cells = []
@@ -134,7 +134,7 @@ class GoogleVisionOcrModel(BaseOcrModel):
                         all_ocr_cells.extend(cells)
 
                     # Post-process the cells
-                    page.cells = self.post_process_cells(all_ocr_cells, page.cells)
+                    self.post_process_cells(all_ocr_cells, page)
 
                 if settings.debug.visualize_ocr:
                     self.draw_ocr_rects_and_cells(conv_res, page, ocr_rects)
