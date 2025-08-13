@@ -132,6 +132,13 @@ def test_guess_format(tmp_path):
     doc_path = Path("./tests/data/html/wiki_duck.html")
     assert dci._guess_format(doc_path) == InputFormat.HTML
 
+    html_str = (  # HTML starting with a script
+        "<script>\nconsole.log('foo');\n</script>"
+        '<!doctype html>\n<html lang="en-us class="no-js"></html>'
+    )
+    stream = DocumentStream(name="lorem_ipsum", stream=BytesIO(f"{html_str}".encode()))
+    assert dci._guess_format(stream) == InputFormat.HTML
+
     # Valid MD
     buf = BytesIO(Path("./tests/data/md/wiki.md").open("rb").read())
     stream = DocumentStream(name="wiki.md", stream=buf)
@@ -236,3 +243,26 @@ def _make_input_doc_from_stream(doc_stream):
         backend=PdfFormatOption().backend,  # use default
     )
     return in_doc
+
+
+def test_tiff_two_pages():
+    tiff_path = Path("./tests/data/tiff/2206.01062.tif")
+    doc = InputDocument(
+        path_or_stream=tiff_path,
+        format=InputFormat.IMAGE,
+        backend=PdfFormatOption().backend,  # use default backend
+    )
+    assert doc.valid is True
+    assert doc.page_count == 2
+
+    # Expect two full-page rectangles
+    rects_page1 = doc._backend.load_page(0).get_bitmap_rects()
+    rects_page2 = doc._backend.load_page(1).get_bitmap_rects()
+
+    page1_rect = next(rects_page1)
+    page2_rect = next(rects_page2)
+
+    assert page1_rect.t == page2_rect.t == 0
+    assert page1_rect.l == page2_rect.l == 0
+    assert page1_rect.r == page2_rect.r == 612.0
+    assert page1_rect.b == page2_rect.b == 792.0

@@ -1,6 +1,9 @@
+import math
+from collections import defaultdict
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Annotated, Dict, List, Literal, Optional, Union
 
+import numpy as np
 from docling_core.types.doc import (
     BoundingBox,
     DocItemLabel,
@@ -9,14 +12,22 @@ from docling_core.types.doc import (
     Size,
     TableCell,
 )
+from docling_core.types.doc.base import PydanticSerCtxKey, round_pydantic_float
 from docling_core.types.doc.page import SegmentedPdfPage, TextCell
-
-# DO NOT REMOVE; explicitly exposed from this location
 from docling_core.types.io import (
     DocumentStream,
 )
+
+# DO NOT REMOVE; explicitly exposed from this location
 from PIL.Image import Image
-from pydantic import BaseModel, ConfigDict
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    FieldSerializationInfo,
+    computed_field,
+    field_serializer,
+)
 
 if TYPE_CHECKING:
     from docling.backend.pdf_backend import PdfPageBackend
@@ -46,6 +57,7 @@ class InputFormat(str, Enum):
     XML_USPTO = "xml_uspto"
     XML_JATS = "xml_jats"
     JSON_DOCLING = "json_docling"
+    AUDIO = "audio"
 
 
 class OutputFormat(str, Enum):
@@ -64,12 +76,13 @@ FormatToExtensions: Dict[InputFormat, List[str]] = {
     InputFormat.MD: ["md"],
     InputFormat.HTML: ["html", "htm", "xhtml"],
     InputFormat.XML_JATS: ["xml", "nxml"],
-    InputFormat.IMAGE: ["jpg", "jpeg", "png", "tif", "tiff", "bmp"],
+    InputFormat.IMAGE: ["jpg", "jpeg", "png", "tif", "tiff", "bmp", "webp"],
     InputFormat.ASCIIDOC: ["adoc", "asciidoc", "asc"],
     InputFormat.CSV: ["csv"],
-    InputFormat.XLSX: ["xlsx"],
+    InputFormat.XLSX: ["xlsx", "xlsm"],
     InputFormat.XML_USPTO: ["xml", "txt"],
     InputFormat.JSON_DOCLING: ["json"],
+    InputFormat.AUDIO: ["wav", "mp3"],
 }
 
 FormatToMimeType: Dict[InputFormat, List[str]] = {
@@ -90,6 +103,7 @@ FormatToMimeType: Dict[InputFormat, List[str]] = {
         "image/tiff",
         "image/gif",
         "image/bmp",
+        "image/webp",
     ],
     InputFormat.PDF: ["application/pdf"],
     InputFormat.ASCIIDOC: ["text/asciidoc"],
@@ -100,6 +114,7 @@ FormatToMimeType: Dict[InputFormat, List[str]] = {
     ],
     InputFormat.XML_USPTO: ["application/xml", "text/plain"],
     InputFormat.JSON_DOCLING: ["application/json"],
+    InputFormat.AUDIO: ["audio/x-wav", "audio/mpeg", "audio/wav", "audio/mp3"],
 }
 
 MimeTypeToFormat: dict[str, list[InputFormat]] = {
@@ -127,12 +142,6 @@ class ErrorItem(BaseModel):
     error_message: str
 
 
-# class Cell(BaseModel):
-#    id: int
-#    text: str
-#    bbox: BoundingBox
-
-
 class Cluster(BaseModel):
     id: int
     label: DocItemLabel
@@ -140,6 +149,10 @@ class Cluster(BaseModel):
     confidence: float = 1.0
     cells: List[TextCell] = []
     children: List["Cluster"] = []  # Add child cluster support
+
+    @field_serializer("confidence")
+    def _serialize(self, value: float, info: FieldSerializationInfo) -> float:
+        return round_pydantic_float(value, info.context, PydanticSerCtxKey.CONFID_PREC)
 
 
 class BasePageElement(BaseModel):
@@ -154,8 +167,16 @@ class LayoutPrediction(BaseModel):
     clusters: List[Cluster] = []
 
 
+class VlmPredictionToken(BaseModel):
+    text: str = ""
+    token: int = -1
+    logprob: float = -1
+
+
 class VlmPrediction(BaseModel):
     text: str = ""
+    generated_tokens: list[VlmPredictionToken] = []
+    generation_time: float = -1
 
 
 class ContainerElement(
@@ -184,6 +205,16 @@ class FigureElement(BasePageElement):
     provenance: Optional[str] = None
     predicted_class: Optional[str] = None
     confidence: Optional[float] = None
+
+    @field_serializer("confidence")
+    def _serialize(
+        self, value: Optional[float], info: FieldSerializationInfo
+    ) -> Optional[float]:
+        return (
+            round_pydantic_float(value, info.context, PydanticSerCtxKey.CONFID_PREC)
+            if value is not None
+            else None
+        )
 
 
 class FigureClassificationPrediction(BaseModel):
@@ -226,7 +257,6 @@ class Page(BaseModel):
     page_no: int
     # page_hash: Optional[str] = None
     size: Optional[Size] = None
-    cells: List[TextCell] = []
     parsed_page: Optional[SegmentedPdfPage] = None
     predictions: PagePredictions = PagePredictions()
     assembled: Optional[AssembledUnit] = None
@@ -239,11 +269,26 @@ class Page(BaseModel):
         float, Image
     ] = {}  # Cache of images in different scales. By default it is cleared during assembling.
 
+    @property
+    def cells(self) -> List[TextCell]:
+        """Return text cells as a read-only view of parsed_page.textline_cells."""
+        if self.parsed_page is not None:
+            return self.parsed_page.textline_cells
+        else:
+            return []
+
     def get_image(
-        self, scale: float = 1.0, cropbox: Optional[BoundingBox] = None
+        self,
+        scale: float = 1.0,
+        max_size: Optional[int] = None,
+        cropbox: Optional[BoundingBox] = None,
     ) -> Optional[Image]:
         if self._backend is None:
             return self._image_cache.get(scale, None)
+
+        if max_size:
+            assert self.size is not None
+            scale = min(scale, max_size / max(self.size.as_tuple()))
 
         if scale not in self._image_cache:
             if cropbox is None:
@@ -278,7 +323,7 @@ class OpenAiChatMessage(BaseModel):
 class OpenAiResponseChoice(BaseModel):
     index: int
     message: OpenAiChatMessage
-    finish_reason: str
+    finish_reason: Optional[str]
 
 
 class OpenAiResponseUsage(BaseModel):
@@ -297,3 +342,97 @@ class OpenAiApiResponse(BaseModel):
     choices: List[OpenAiResponseChoice]
     created: int
     usage: OpenAiResponseUsage
+
+
+# Create a type alias for score values
+ScoreValue = float
+
+
+class QualityGrade(str, Enum):
+    POOR = "poor"
+    FAIR = "fair"
+    GOOD = "good"
+    EXCELLENT = "excellent"
+    UNSPECIFIED = "unspecified"
+
+
+class PageConfidenceScores(BaseModel):
+    parse_score: ScoreValue = np.nan
+    layout_score: ScoreValue = np.nan
+    table_score: ScoreValue = np.nan
+    ocr_score: ScoreValue = np.nan
+
+    def _score_to_grade(self, score: ScoreValue) -> QualityGrade:
+        if score < 0.5:
+            return QualityGrade.POOR
+        elif score < 0.8:
+            return QualityGrade.FAIR
+        elif score < 0.9:
+            return QualityGrade.GOOD
+        elif score >= 0.9:
+            return QualityGrade.EXCELLENT
+
+        return QualityGrade.UNSPECIFIED
+
+    @computed_field  # type: ignore
+    @property
+    def mean_grade(self) -> QualityGrade:
+        return self._score_to_grade(self.mean_score)
+
+    @computed_field  # type: ignore
+    @property
+    def low_grade(self) -> QualityGrade:
+        return self._score_to_grade(self.low_score)
+
+    @computed_field  # type: ignore
+    @property
+    def mean_score(self) -> ScoreValue:
+        return ScoreValue(
+            np.nanmean(
+                [
+                    self.ocr_score,
+                    self.table_score,
+                    self.layout_score,
+                    self.parse_score,
+                ]
+            )
+        )
+
+    @computed_field  # type: ignore
+    @property
+    def low_score(self) -> ScoreValue:
+        return ScoreValue(
+            np.nanquantile(
+                [
+                    self.ocr_score,
+                    self.table_score,
+                    self.layout_score,
+                    self.parse_score,
+                ],
+                q=0.05,
+            )
+        )
+
+
+class ConfidenceReport(PageConfidenceScores):
+    pages: Dict[int, PageConfidenceScores] = Field(
+        default_factory=lambda: defaultdict(PageConfidenceScores)
+    )
+
+    @computed_field  # type: ignore
+    @property
+    def mean_score(self) -> ScoreValue:
+        return ScoreValue(
+            np.nanmean(
+                [c.mean_score for c in self.pages.values()],
+            )
+        )
+
+    @computed_field  # type: ignore
+    @property
+    def low_score(self) -> ScoreValue:
+        return ScoreValue(
+            np.nanmean(
+                [c.low_score for c in self.pages.values()],
+            )
+        )

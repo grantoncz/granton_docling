@@ -193,6 +193,17 @@ class PaginatedPipeline(BasePipeline):  # TODO this is a bad name.
                 )
                 raise e
 
+            # Filter out uninitialized pages (those with size=None) that may remain
+            # after timeout or processing failures to prevent assertion errors downstream
+            initial_page_count = len(conv_res.pages)
+            conv_res.pages = [page for page in conv_res.pages if page.size is not None]
+
+            if len(conv_res.pages) < initial_page_count:
+                _log.info(
+                    f"Filtered out {initial_page_count - len(conv_res.pages)} uninitialized pages "
+                    f"due to timeout or processing failures"
+                )
+
         return conv_res
 
     def _unload(self, conv_res: ConversionResult) -> ConversionResult:
@@ -206,7 +217,13 @@ class PaginatedPipeline(BasePipeline):  # TODO this is a bad name.
         return conv_res
 
     def _determine_status(self, conv_res: ConversionResult) -> ConversionStatus:
-        status = ConversionStatus.SUCCESS
+        status = conv_res.status
+        if status in [
+            ConversionStatus.PENDING,
+            ConversionStatus.STARTED,
+        ]:  # preserves ConversionStatus.PARTIAL_SUCCESS
+            status = ConversionStatus.SUCCESS
+
         for page in conv_res.pages:
             if page._backend is None or not page._backend.is_valid():
                 conv_res.errors.append(

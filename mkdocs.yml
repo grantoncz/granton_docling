@@ -60,12 +60,15 @@ nav:
       - Usage: usage/index.md
       - Supported formats: usage/supported_formats.md
       - Enrichment features: usage/enrichments.md
+      - Vision models: usage/vision_models.md
     - FAQ:
       - FAQ: faq/index.md
   - Concepts:
     - Concepts: concepts/index.md
     - Architecture: concepts/architecture.md
     - Docling Document: concepts/docling_document.md
+    - Serialization: concepts/serialization.md
+    - Confidence Scores: concepts/confidence_scores.md
     - Chunking: concepts/chunking.md
     - Plugins: concepts/plugins.md
   - Examples:
@@ -77,6 +80,8 @@ nav:
       - "Multi-format conversion": examples/run_with_formats.py
       - "VLM pipeline with SmolDocling": examples/minimal_vlm_pipeline.py
       - "VLM pipeline with remote model": examples/vlm_pipeline_api_model.py
+      - "VLM comparison": examples/compare_vlm_models.py
+      - "ASR pipeline with Whisper": examples/minimal_asr_pipeline.py
       - "Figure export": examples/export_figures.py
       - "Table export": examples/export_tables.py
       - "Multimodal export": examples/export_multimodal.py
@@ -87,8 +92,10 @@ nav:
       - "Simple translation": examples/translate.py
       - examples/backend_csv.ipynb
       - examples/backend_xml_rag.ipynb
-    - ✂️ Chunking:
+    - ✂️ Serialization & chunking:
+      - examples/serialization.ipynb
       - examples/hybrid_chunking.ipynb
+      - examples/advanced_chunking_and_serialization.ipynb
     - 🤖 RAG with AI dev frameworks:
       - examples/rag_haystack.ipynb
       - examples/rag_langchain.ipynb
@@ -100,6 +107,7 @@ nav:
     - ✨ Enrichment development:
       - "Figure enrichment": examples/develop_picture_enrichment.py
       - "Formula enrichment": examples/develop_formula_understanding.py
+      - "Enrich a DoclingDocument": examples/enrich_doclingdocument.py
     - 🗂️ More examples:
       - examples/rag_milvus.ipynb
       - examples/rag_weaviate.ipynb
@@ -113,6 +121,7 @@ nav:
       - "Crew AI": integrations/crewai.md
       - "Haystack": integrations/haystack.md
       - "LangChain": integrations/langchain.md
+      - "Langflow": integrations/langflow.md
       - "LlamaIndex": integrations/llamaindex.md
       - "txtai": integrations/txtai.md
     - ⭐️ Featured:
@@ -124,10 +133,12 @@ nav:
       - "RHEL AI": integrations/rhel_ai.md
       - "spaCy": integrations/spacy.md
     - 🗂️ More integrations:
+      - "Arconia": integrations/arconia.md
       - "Cloudera": integrations/cloudera.md
       - "DocETL": integrations/docetl.md
       - "Kotaemon": integrations/kotaemon.md
       - "OpenContracts": integrations/opencontracts.md
+      - "Open WebUI": integrations/openwebui.md
       - "Vectara": integrations/vectara.md
   - Reference:
     - Python API:

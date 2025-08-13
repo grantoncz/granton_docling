@@ -2,7 +2,7 @@ import logging
 import re
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, List, Optional, Union
 
 from docling_core.types.doc import (
     DocItemLabel,
@@ -10,6 +10,7 @@ from docling_core.types.doc import (
     DocumentOrigin,
     GroupLabel,
     ImageRef,
+    ListGroup,
     NodeItem,
     TableCell,
     TableData,
@@ -24,7 +25,6 @@ from docx.text.hyperlink import Hyperlink
 from docx.text.paragraph import Paragraph
 from docx.text.run import Run
 from lxml import etree
-from lxml.etree import XPath
 from PIL import Image, UnidentifiedImageError
 from pydantic import AnyUrl
 from typing_extensions import override
@@ -59,6 +59,9 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
         self.parents: dict[int, Optional[NodeItem]] = {}
         self.numbered_headers: dict[int, int] = {}
         self.equation_bookends: str = "<eq>{EQ}</eq>"
+        # Track processed textbox elements to avoid duplication
+        self.processed_textbox_elements: List[int] = []
+
         for i in range(-1, self.max_levels):
             self.parents[i] = None
 
@@ -82,7 +85,7 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
             self.valid = True
         except Exception as e:
             raise RuntimeError(
-                f"MsPowerpointDocumentBackend could not load document with hash {self.document_hash}"
+                f"MsWordDocumentBackend could not load document with hash {self.document_hash}"
             ) from e
 
     @override
@@ -175,9 +178,73 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
                 "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
                 "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
                 "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+                "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+                "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
+                "v": "urn:schemas-microsoft-com:vml",
+                "wps": "http://schemas.microsoft.com/office/word/2010/wordprocessingShape",
+                "w10": "urn:schemas-microsoft-com:office:word",
+                "a14": "http://schemas.microsoft.com/office/drawing/2010/main",
             }
-            xpath_expr = XPath(".//a:blip", namespaces=namespaces)
+            xpath_expr = etree.XPath(".//a:blip", namespaces=namespaces)
             drawing_blip = xpath_expr(element)
+
+            # Check for textbox content - check multiple textbox formats
+            # Only process if the element hasn't been processed before
+            element_id = id(element)
+            if element_id not in self.processed_textbox_elements:
+                # Modern Word textboxes
+                txbx_xpath = etree.XPath(
+                    ".//w:txbxContent|.//v:textbox//w:p", namespaces=namespaces
+                )
+                textbox_elements = txbx_xpath(element)
+
+                # No modern textboxes found, check for alternate/legacy textbox formats
+                if not textbox_elements and tag_name in ["drawing", "pict"]:
+                    # Additional checks for textboxes in DrawingML and VML formats
+                    alt_txbx_xpath = etree.XPath(
+                        ".//wps:txbx//w:p|.//w10:wrap//w:p|.//a:p//a:t",
+                        namespaces=namespaces,
+                    )
+                    textbox_elements = alt_txbx_xpath(element)
+
+                    # Check for shape text that's not in a standard textbox
+                    if not textbox_elements:
+                        shape_text_xpath = etree.XPath(
+                            ".//a:bodyPr/ancestor::*//a:t|.//a:txBody//a:t",
+                            namespaces=namespaces,
+                        )
+                        shape_text_elements = shape_text_xpath(element)
+                        if shape_text_elements:
+                            # Create custom text elements from shape text
+                            text_content = " ".join(
+                                [t.text for t in shape_text_elements if t.text]
+                            )
+                            if text_content.strip():
+                                _log.debug(f"Found shape text: {text_content[:50]}...")
+                                # Create a paragraph-like element to process with standard handler
+                                level = self._get_level()
+                                shape_group = doc.add_group(
+                                    label=GroupLabel.SECTION,
+                                    parent=self.parents[level - 1],
+                                    name="shape-text",
+                                )
+                                doc.add_text(
+                                    label=DocItemLabel.PARAGRAPH,
+                                    parent=shape_group,
+                                    text=text_content,
+                                )
+
+                if textbox_elements:
+                    # Mark the parent element as processed
+                    self.processed_textbox_elements.append(element_id)
+                    # Also mark all found textbox elements as processed
+                    for tb_element in textbox_elements:
+                        self.processed_textbox_elements.append(id(tb_element))
+
+                    _log.debug(
+                        f"Found textbox content with {len(textbox_elements)} elements"
+                    )
+                    self._handle_textbox_content(textbox_elements, docx_obj, doc)
 
             # Check for Tables
             if element.tag.endswith("tbl"):
@@ -185,9 +252,15 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
                     self._handle_tables(element, docx_obj, doc)
                 except Exception:
                     _log.debug("could not parse a table, broken docx table")
-
+            # Check for Image
             elif drawing_blip:
                 self._handle_pictures(docx_obj, drawing_blip, doc)
+                # Check for Text after the Image
+                if (
+                    tag_name in ["p"]
+                    and element.find(".//w:t", namespaces=namespaces) is not None
+                ):
+                    self._handle_text_elements(element, docx_obj, doc)
             # Check for the sdt containers, like table of contents
             elif tag_name in ["sdt"]:
                 sdt_content = element.find(".//w:sdtContent", namespaces=namespaces)
@@ -202,6 +275,7 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
                 self._handle_text_elements(element, docx_obj, doc)
             else:
                 _log.debug(f"Ignoring element in DOCX with tag: {tag_name}")
+
         return doc
 
     def _str_to_int(
@@ -291,15 +365,17 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
 
     @classmethod
     def _get_format_from_run(cls, run: Run) -> Optional[Formatting]:
-        has_any_formatting = run.bold or run.italic or run.underline
-        return (
-            Formatting(
-                bold=run.bold or False,
-                italic=run.italic or False,
-                underline=run.underline or False,
-            )
-            if has_any_formatting
-            else None
+        # The .bold and .italic properties are booleans, but .underline can be an enum
+        # like WD_UNDERLINE.THICK (value 6), so we need to convert it to a boolean
+        has_bold = run.bold or False
+        has_italic = run.italic or False
+        # Convert any non-None underline value to True
+        has_underline = bool(run.underline is not None and run.underline)
+
+        return Formatting(
+            bold=has_bold,
+            italic=has_italic,
+            underline=has_underline,
         )
 
     def _get_paragraph_elements(self, paragraph: Paragraph):
@@ -322,7 +398,11 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
             if isinstance(c, Hyperlink):
                 text = c.text
                 hyperlink = Path(c.address)
-                format = self._get_format_from_run(c.runs[0])
+                format = (
+                    self._get_format_from_run(c.runs[0])
+                    if c.runs and len(c.runs) > 0
+                    else None
+                )
             elif isinstance(c, Run):
                 text = c.text
                 hyperlink = None
@@ -354,6 +434,202 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
             paragraph_elements.append((group_text.strip(), format, None))
 
         return paragraph_elements
+
+    def _get_paragraph_position(self, paragraph_element):
+        """Extract vertical position information from paragraph element."""
+        # First try to directly get the index from w:p element that has an order-related attribute
+        if (
+            hasattr(paragraph_element, "getparent")
+            and paragraph_element.getparent() is not None
+        ):
+            parent = paragraph_element.getparent()
+            # Get all paragraph siblings
+            paragraphs = [
+                p for p in parent.getchildren() if etree.QName(p).localname == "p"
+            ]
+            # Find index of current paragraph within its siblings
+            try:
+                paragraph_index = paragraphs.index(paragraph_element)
+                return paragraph_index  # Use index as position for consistent ordering
+            except ValueError:
+                pass
+
+        # Look for position hints in element attributes and ancestor elements
+        for elem in (*[paragraph_element], *paragraph_element.iterancestors()):
+            # Check for direct position attributes
+            for attr_name in ["y", "top", "positionY", "y-position", "position"]:
+                value = elem.get(attr_name)
+                if value:
+                    try:
+                        # Remove any non-numeric characters (like 'pt', 'px', etc.)
+                        clean_value = re.sub(r"[^0-9.]", "", value)
+                        if clean_value:
+                            return float(clean_value)
+                    except (ValueError, TypeError):
+                        pass
+
+            # Check for position in transform attribute
+            transform = elem.get("transform")
+            if transform:
+                # Extract translation component from transform matrix
+                match = re.search(r"translate\([^,]+,\s*([0-9.]+)", transform)
+                if match:
+                    try:
+                        return float(match.group(1))
+                    except ValueError:
+                        pass
+
+            # Check for anchors or relative position indicators in Word format
+            # 'dist' attributes can indicate relative positioning
+            for attr_name in ["distT", "distB", "anchor", "relativeFrom"]:
+                if elem.get(attr_name) is not None:
+                    return elem.sourceline  # Use the XML source line number as fallback
+
+        # For VML shapes, look for specific attributes
+        for ns_uri in paragraph_element.nsmap.values():
+            if "vml" in ns_uri:
+                # Try to extract position from style attribute
+                style = paragraph_element.get("style")
+                if style:
+                    match = re.search(r"top:([0-9.]+)pt", style)
+                    if match:
+                        try:
+                            return float(match.group(1))
+                        except ValueError:
+                            pass
+
+        # If no better position indicator found, use XML source line number as proxy for order
+        return (
+            paragraph_element.sourceline
+            if hasattr(paragraph_element, "sourceline")
+            else None
+        )
+
+    def _collect_textbox_paragraphs(self, textbox_elements):
+        """Collect and organize paragraphs from textbox elements."""
+        processed_paragraphs = []
+        container_paragraphs = {}
+
+        for element in textbox_elements:
+            element_id = id(element)
+            # Skip if we've already processed this exact element
+            if element_id in processed_paragraphs:
+                continue
+
+            tag_name = etree.QName(element).localname
+            processed_paragraphs.append(element_id)
+
+            # Handle paragraphs directly found (VML textboxes)
+            if tag_name == "p":
+                # Find the containing textbox or shape element
+                container_id = None
+                for ancestor in element.iterancestors():
+                    if any(ns in ancestor.tag for ns in ["textbox", "shape", "txbx"]):
+                        container_id = id(ancestor)
+                        break
+
+                if container_id not in container_paragraphs:
+                    container_paragraphs[container_id] = []
+                container_paragraphs[container_id].append(
+                    (element, self._get_paragraph_position(element))
+                )
+
+            # Handle txbxContent elements (Word DrawingML textboxes)
+            elif tag_name == "txbxContent":
+                paragraphs = element.findall(".//w:p", namespaces=element.nsmap)
+                container_id = id(element)
+                if container_id not in container_paragraphs:
+                    container_paragraphs[container_id] = []
+
+                for p in paragraphs:
+                    p_id = id(p)
+                    if p_id not in processed_paragraphs:
+                        processed_paragraphs.append(p_id)
+                        container_paragraphs[container_id].append(
+                            (p, self._get_paragraph_position(p))
+                        )
+            else:
+                # Try to extract any paragraphs from unknown elements
+                paragraphs = element.findall(".//w:p", namespaces=element.nsmap)
+                container_id = id(element)
+                if container_id not in container_paragraphs:
+                    container_paragraphs[container_id] = []
+
+                for p in paragraphs:
+                    p_id = id(p)
+                    if p_id not in processed_paragraphs:
+                        processed_paragraphs.append(p_id)
+                        container_paragraphs[container_id].append(
+                            (p, self._get_paragraph_position(p))
+                        )
+
+        return container_paragraphs
+
+    def _handle_textbox_content(
+        self,
+        textbox_elements: list,
+        docx_obj: DocxDocument,
+        doc: DoclingDocument,
+    ) -> None:
+        """Process textbox content and add it to the document structure."""
+        level = self._get_level()
+        # Create a textbox group to contain all text from the textbox
+        textbox_group = doc.add_group(
+            label=GroupLabel.SECTION, parent=self.parents[level - 1], name="textbox"
+        )
+
+        # Set this as the current parent to ensure textbox content
+        # is properly nested in document structure
+        original_parent = self.parents[level]
+        self.parents[level] = textbox_group
+
+        # Collect and organize paragraphs
+        container_paragraphs = self._collect_textbox_paragraphs(textbox_elements)
+
+        # Process all paragraphs
+        all_paragraphs = []
+
+        # Sort paragraphs within each container, then process containers
+        for paragraphs in container_paragraphs.values():
+            # Sort by vertical position within each container
+            sorted_container_paragraphs = sorted(
+                paragraphs,
+                key=lambda x: (
+                    x[1] is None,
+                    x[1] if x[1] is not None else float("inf"),
+                ),
+            )
+
+            # Add the sorted paragraphs to our processing list
+            all_paragraphs.extend(sorted_container_paragraphs)
+
+        # Track processed paragraphs to avoid duplicates (same content and position)
+        processed_paragraphs = set()
+
+        # Process all the paragraphs
+        for p, position in all_paragraphs:
+            # Create paragraph object to get text content
+            paragraph = Paragraph(p, docx_obj)
+            text_content = paragraph.text
+
+            # Create a unique identifier based on content and position
+            paragraph_id = (text_content, position)
+
+            # Skip if this paragraph (same content and position) was already processed
+            if paragraph_id in processed_paragraphs:
+                _log.debug(
+                    f"Skipping duplicate paragraph: content='{text_content[:50]}...', position={position}"
+                )
+                continue
+
+            # Mark this paragraph as processed
+            processed_paragraphs.add(paragraph_id)
+
+            self._handle_text_elements(p, docx_obj, doc)
+
+        # Restore original parent
+        self.parents[level] = original_parent
+        return
 
     def _handle_equations_in_text(self, element, text):
         only_texts = []
@@ -413,7 +689,7 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
         paragraph_elements: list,
     ) -> Optional[NodeItem]:
         return (
-            doc.add_group(label=GroupLabel.INLINE, parent=prev_parent)
+            doc.add_inline_group(parent=prev_parent)
             if len(paragraph_elements) > 1
             else prev_parent
         )
@@ -425,13 +701,13 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
         doc: DoclingDocument,
     ) -> None:
         paragraph = Paragraph(element, docx_obj)
-
-        raw_text = paragraph.text
-        text, equations = self._handle_equations_in_text(element=element, text=raw_text)
+        paragraph_elements = self._get_paragraph_elements(paragraph)
+        text, equations = self._handle_equations_in_text(
+            element=element, text=paragraph.text
+        )
 
         if text is None:
             return
-        paragraph_elements = self._get_paragraph_elements(paragraph)
         text = text.strip()
 
         # Common styles for bullet and numbered lists.
@@ -493,7 +769,9 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
             self._add_header(doc, p_level, text, is_numbered_style)
 
         elif len(equations) > 0:
-            if (raw_text is None or len(raw_text.strip()) == 0) and len(text) > 0:
+            if (paragraph.text is None or len(paragraph.text.strip()) == 0) and len(
+                text
+            ) > 0:
                 # Standalone equation
                 level = self._get_level()
                 doc.add_text(
@@ -504,9 +782,7 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
             else:
                 # Inline equation
                 level = self._get_level()
-                inline_equation = doc.add_group(
-                    label=GroupLabel.INLINE, parent=self.parents[level - 1]
-                )
+                inline_equation = doc.add_inline_group(parent=self.parents[level - 1])
                 text_tmp = text
                 for eq in equations:
                     if len(text_tmp) == 0:
@@ -645,6 +921,49 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
         )
         return
 
+    def _add_formatted_list_item(
+        self,
+        doc: DoclingDocument,
+        elements: list,
+        marker: str,
+        enumerated: bool,
+        level: int,
+    ) -> None:
+        # This should not happen by construction
+        if not isinstance(self.parents[level], ListGroup):
+            return
+        if not elements:
+            return
+
+        if len(elements) == 1:
+            text, format, hyperlink = elements[0]
+            if text:
+                doc.add_list_item(
+                    marker=marker,
+                    enumerated=enumerated,
+                    parent=self.parents[level],
+                    text=text,
+                    formatting=format,
+                    hyperlink=hyperlink,
+                )
+        else:
+            new_item = doc.add_list_item(
+                marker=marker,
+                enumerated=enumerated,
+                parent=self.parents[level],
+                text="",
+            )
+            new_parent = doc.add_inline_group(parent=new_item)
+            for text, format, hyperlink in elements:
+                if text:
+                    doc.add_text(
+                        label=DocItemLabel.TEXT,
+                        parent=new_parent,
+                        text=text,
+                        formatting=format,
+                        hyperlink=hyperlink,
+                    )
+
     def _add_list_item(
         self,
         *,
@@ -654,6 +973,9 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
         elements: list,
         is_numbered: bool = False,
     ) -> None:
+        # TODO: this method is always called with is_numbered. Numbered lists should be properly addressed.
+        if not elements:
+            return None
         enum_marker = ""
 
         level = self._get_level()
@@ -661,8 +983,8 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
         if self._prev_numid() is None:  # Open new list
             self.level_at_new_list = level
 
-            self.parents[level] = doc.add_group(
-                label=GroupLabel.LIST, name="list", parent=self.parents[level - 1]
+            self.parents[level] = doc.add_list_group(
+                name="list", parent=self.parents[level - 1]
             )
 
             # Set marker and enumerated arguments if this is an enumeration element.
@@ -670,21 +992,9 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
             if is_numbered:
                 enum_marker = str(self.listIter) + "."
                 is_numbered = True
-            new_parent = self._create_or_reuse_parent(
-                doc=doc,
-                prev_parent=self.parents[level],
-                paragraph_elements=elements,
+            self._add_formatted_list_item(
+                doc, elements, enum_marker, is_numbered, level
             )
-            for text, format, hyperlink in elements:
-                doc.add_list_item(
-                    marker=enum_marker,
-                    enumerated=is_numbered,
-                    parent=new_parent,
-                    text=text,
-                    formatting=format,
-                    hyperlink=hyperlink,
-                )
-
         elif (
             self._prev_numid() == numid
             and self.level_at_new_list is not None
@@ -695,47 +1005,30 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
                 self.level_at_new_list + prev_indent + 1,
                 self.level_at_new_list + ilevel + 1,
             ):
-                # Determine if this is an unordered list or an ordered list.
-                # Set GroupLabel.ORDERED_LIST when it fits.
                 self.listIter = 0
-                if is_numbered:
-                    self.parents[i] = doc.add_group(
-                        label=GroupLabel.ORDERED_LIST,
-                        name="list",
-                        parent=self.parents[i - 1],
-                    )
-                else:
-                    self.parents[i] = doc.add_group(
-                        label=GroupLabel.LIST, name="list", parent=self.parents[i - 1]
-                    )
+                self.parents[i] = doc.add_list_group(
+                    name="list", parent=self.parents[i - 1]
+                )
 
             # TODO: Set marker and enumerated arguments if this is an enumeration element.
             self.listIter += 1
             if is_numbered:
                 enum_marker = str(self.listIter) + "."
                 is_numbered = True
-
-            new_parent = self._create_or_reuse_parent(
-                doc=doc,
-                prev_parent=self.parents[self.level_at_new_list + ilevel],
-                paragraph_elements=elements,
+            self._add_formatted_list_item(
+                doc,
+                elements,
+                enum_marker,
+                is_numbered,
+                self.level_at_new_list + ilevel,
             )
-            for text, format, hyperlink in elements:
-                doc.add_list_item(
-                    marker=enum_marker,
-                    enumerated=is_numbered,
-                    parent=new_parent,
-                    text=text,
-                    formatting=format,
-                    hyperlink=hyperlink,
-                )
         elif (
             self._prev_numid() == numid
             and self.level_at_new_list is not None
             and prev_indent is not None
             and ilevel < prev_indent
         ):  # Close list
-            for k, v in self.parents.items():
+            for k in self.parents:
                 if k > self.level_at_new_list + ilevel:
                     self.parents[k] = None
 
@@ -744,20 +1037,13 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
             if is_numbered:
                 enum_marker = str(self.listIter) + "."
                 is_numbered = True
-            new_parent = self._create_or_reuse_parent(
-                doc=doc,
-                prev_parent=self.parents[self.level_at_new_list + ilevel],
-                paragraph_elements=elements,
+            self._add_formatted_list_item(
+                doc,
+                elements,
+                enum_marker,
+                is_numbered,
+                self.level_at_new_list + ilevel,
             )
-            for text, format, hyperlink in elements:
-                doc.add_list_item(
-                    marker=enum_marker,
-                    enumerated=is_numbered,
-                    parent=new_parent,
-                    text=text,
-                    formatting=format,
-                    hyperlink=hyperlink,
-                )
             self.listIter = 0
 
         elif self._prev_numid() == numid or prev_indent == ilevel:
@@ -766,21 +1052,10 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
             if is_numbered:
                 enum_marker = str(self.listIter) + "."
                 is_numbered = True
-            new_parent = self._create_or_reuse_parent(
-                doc=doc,
-                prev_parent=self.parents[level - 1],
-                paragraph_elements=elements,
+            self._add_formatted_list_item(
+                doc, elements, enum_marker, is_numbered, level - 1
             )
-            for text, format, hyperlink in elements:
-                # Add the list item to the parent group
-                doc.add_list_item(
-                    marker=enum_marker,
-                    enumerated=is_numbered,
-                    parent=new_parent,
-                    text=text,
-                    formatting=format,
-                    hyperlink=hyperlink,
-                )
+
         return
 
     def _handle_tables(
@@ -829,8 +1104,17 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
                     )
                 _log.debug(f"  spanned before row {spanned_idx}")
 
+                # Detect equations in cell text
+                text, equations = self._handle_equations_in_text(
+                    element=cell._element, text=cell.text
+                )
+                if len(equations) == 0:
+                    text = cell.text
+                else:
+                    text = text.replace("<eq>", "$").replace("</eq>", "$")
+
                 table_cell = TableCell(
-                    text=cell.text,
+                    text=text,
                     row_span=spanned_idx - row_idx,
                     col_span=cell.grid_span,
                     start_row_offset_idx=row.grid_cols_before + row_idx,

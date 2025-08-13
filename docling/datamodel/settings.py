@@ -26,18 +26,13 @@ class DocumentLimits(BaseModel):
 
 
 class BatchConcurrencySettings(BaseModel):
-    doc_batch_size: int = 2
-    doc_batch_concurrency: int = 2
-    page_batch_size: int = 4
-    page_batch_concurrency: int = 2
-    elements_batch_size: int = 16
-
-    # doc_batch_size: int = 1
-    # doc_batch_concurrency: int = 1
-    # page_batch_size: int = 1
-    # page_batch_concurrency: int = 1
-
-    # model_concurrency: int = 2
+    doc_batch_size: int = 1  # Number of documents processed in one batch. Should be >= doc_batch_concurrency
+    doc_batch_concurrency: int = 1  # Number of parallel threads processing documents. Warning: Experimental! No benefit expected without free-threaded python.
+    page_batch_size: int = 4  # Number of pages processed in one batch.
+    page_batch_concurrency: int = 1  # Currently unused.
+    elements_batch_size: int = (
+        16  # Number of elements processed in one batch, in enrichment models.
+    )
 
     # To force models into single core: export OMP_NUM_THREADS=1
 
@@ -56,13 +51,15 @@ class DebugSettings(BaseModel):
 
 
 class AppSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="DOCLING_", env_nested_delimiter="_")
+    model_config = SettingsConfigDict(
+        env_prefix="DOCLING_", env_nested_delimiter="_", env_nested_max_split=1
+    )
 
-    perf: BatchConcurrencySettings
-    debug: DebugSettings
+    perf: BatchConcurrencySettings = BatchConcurrencySettings()
+    debug: DebugSettings = DebugSettings()
 
     cache_dir: Path = Path.home() / ".cache" / "docling"
     artifacts_path: Optional[Path] = None
 
 
-settings = AppSettings(perf=BatchConcurrencySettings(), debug=DebugSettings())
+settings = AppSettings()

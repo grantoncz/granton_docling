@@ -3,17 +3,20 @@ import logging
 import warnings
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Union
 
+import numpy as np
 from docling_core.types.doc import DocItemLabel
-from docling_ibm_models.layoutmodel.layout_predictor import LayoutPredictor
 from PIL import Image
 
+from docling.datamodel.accelerator_options import AcceleratorOptions
 from docling.datamodel.base_models import BoundingBox, Cluster, LayoutPrediction, Page
 from docling.datamodel.document import ConversionResult
-from docling.datamodel.pipeline_options import AcceleratorOptions
+from docling.datamodel.layout_model_specs import DOCLING_LAYOUT_V2, LayoutModelConfig
+from docling.datamodel.pipeline_options import LayoutOptions
 from docling.datamodel.settings import settings
 from docling.models.base_model import BasePageModel
+from docling.models.utils.hf_model_download import download_hf_model
 from docling.utils.accelerator_utils import decide_device
 from docling.utils.layout_postprocessor import LayoutPostprocessor
 from docling.utils.profiling import TimeRecorder
@@ -23,9 +26,6 @@ _log = logging.getLogger(__name__)
 
 
 class LayoutModel(BasePageModel):
-    _model_repo_folder = "ds4sd--docling-models"
-    _model_path = "model_artifacts/layout"
-
     TEXT_ELEM_LABELS = [
         DocItemLabel.TEXT,
         DocItemLabel.FOOTNOTE,
@@ -47,28 +47,38 @@ class LayoutModel(BasePageModel):
     CONTAINER_LABELS = [DocItemLabel.FORM, DocItemLabel.KEY_VALUE_REGION]
 
     def __init__(
-        self, artifacts_path: Optional[Path], accelerator_options: AcceleratorOptions
+        self,
+        artifacts_path: Optional[Path],
+        accelerator_options: AcceleratorOptions,
+        options: LayoutOptions,
     ):
+        from docling_ibm_models.layoutmodel.layout_predictor import LayoutPredictor
+
+        self.options = options
+
         device = decide_device(accelerator_options.device)
+        layout_model_config = options.model_spec
+        model_repo_folder = layout_model_config.model_repo_folder
+        model_path = layout_model_config.model_path
 
         if artifacts_path is None:
-            artifacts_path = self.download_models() / self._model_path
+            artifacts_path = (
+                self.download_models(layout_model_config=layout_model_config)
+                / model_path
+            )
         else:
-            # will become the default in the future
-            if (artifacts_path / self._model_repo_folder).exists():
-                artifacts_path = (
-                    artifacts_path / self._model_repo_folder / self._model_path
-                )
-            elif (artifacts_path / self._model_path).exists():
+            if (artifacts_path / model_repo_folder).exists():
+                artifacts_path = artifacts_path / model_repo_folder / model_path
+            elif (artifacts_path / model_path).exists():
                 warnings.warn(
                     "The usage of artifacts_path containing directly "
-                    f"{self._model_path} is deprecated. Please point "
+                    f"{model_path} is deprecated. Please point "
                     "the artifacts_path to the parent containing "
-                    f"the {self._model_repo_folder} folder.",
+                    f"the {model_repo_folder} folder.",
                     DeprecationWarning,
                     stacklevel=3,
                 )
-                artifacts_path = artifacts_path / self._model_path
+                artifacts_path = artifacts_path / model_path
 
         self.layout_predictor = LayoutPredictor(
             artifact_path=str(artifacts_path),
@@ -81,20 +91,15 @@ class LayoutModel(BasePageModel):
         local_dir: Optional[Path] = None,
         force: bool = False,
         progress: bool = False,
+        layout_model_config: LayoutModelConfig = DOCLING_LAYOUT_V2,
     ) -> Path:
-        from huggingface_hub import snapshot_download
-        from huggingface_hub.utils import disable_progress_bars
-
-        if not progress:
-            disable_progress_bars()
-        download_path = snapshot_download(
-            repo_id="ds4sd/docling-models",
-            force_download=force,
+        return download_hf_model(
+            repo_id=layout_model_config.repo_id,
+            revision=layout_model_config.revision,
             local_dir=local_dir,
-            revision="v2.1.0",
+            force=force,
+            progress=progress,
         )
-
-        return Path(download_path)
 
     def draw_clusters_and_cells_side_by_side(
         self, conv_res, page, clusters, mode_prefix: str, show: bool = False
@@ -143,55 +148,90 @@ class LayoutModel(BasePageModel):
     def __call__(
         self, conv_res: ConversionResult, page_batch: Iterable[Page]
     ) -> Iterable[Page]:
-        for page in page_batch:
+        # Convert to list to allow multiple iterations
+        pages = list(page_batch)
+
+        # Separate valid and invalid pages
+        valid_pages = []
+        valid_page_images: List[Union[Image.Image, np.ndarray]] = []
+
+        for page in pages:
+            assert page._backend is not None
+            if not page._backend.is_valid():
+                continue
+
+            assert page.size is not None
+            page_image = page.get_image(scale=1.0)
+            assert page_image is not None
+
+            valid_pages.append(page)
+            valid_page_images.append(page_image)
+
+        # Process all valid pages with batch prediction
+        batch_predictions = []
+        if valid_page_images:
+            with TimeRecorder(conv_res, "layout"):
+                batch_predictions = self.layout_predictor.predict_batch(  # type: ignore[attr-defined]
+                    valid_page_images
+                )
+
+        # Process each page with its predictions
+        valid_page_idx = 0
+        for page in pages:
             assert page._backend is not None
             if not page._backend.is_valid():
                 yield page
-            else:
-                with TimeRecorder(conv_res, "layout"):
-                    assert page.size is not None
-                    page_image = page.get_image(scale=1.0)
-                    assert page_image is not None
+                continue
 
-                    clusters = []
-                    for ix, pred_item in enumerate(
-                        self.layout_predictor.predict(page_image)
-                    ):
-                        label = DocItemLabel(
-                            pred_item["label"]
-                            .lower()
-                            .replace(" ", "_")
-                            .replace("-", "_")
-                        )  # Temporary, until docling-ibm-model uses docling-core types
-                        cluster = Cluster(
-                            id=ix,
-                            label=label,
-                            confidence=pred_item["confidence"],
-                            bbox=BoundingBox.model_validate(pred_item),
-                            cells=[],
-                        )
-                        clusters.append(cluster)
+            page_predictions = batch_predictions[valid_page_idx]
+            valid_page_idx += 1
 
-                    if settings.debug.visualize_raw_layout:
-                        self.draw_clusters_and_cells_side_by_side(
-                            conv_res, page, clusters, mode_prefix="raw"
-                        )
+            clusters = []
+            for ix, pred_item in enumerate(page_predictions):
+                label = DocItemLabel(
+                    pred_item["label"].lower().replace(" ", "_").replace("-", "_")
+                )  # Temporary, until docling-ibm-model uses docling-core types
+                cluster = Cluster(
+                    id=ix,
+                    label=label,
+                    confidence=pred_item["confidence"],
+                    bbox=BoundingBox.model_validate(pred_item),
+                    cells=[],
+                )
+                clusters.append(cluster)
 
-                    # Apply postprocessing
+            if settings.debug.visualize_raw_layout:
+                self.draw_clusters_and_cells_side_by_side(
+                    conv_res, page, clusters, mode_prefix="raw"
+                )
 
-                    processed_clusters, processed_cells = LayoutPostprocessor(
-                        page.cells, clusters, page.size
-                    ).postprocess()
-                    # processed_clusters, processed_cells = clusters, page.cells
+            # Apply postprocessing
+            processed_clusters, processed_cells = LayoutPostprocessor(
+                page, clusters, self.options
+            ).postprocess()
+            # Note: LayoutPostprocessor updates page.cells and page.parsed_page internally
 
-                    page.cells = processed_cells
-                    page.predictions.layout = LayoutPrediction(
-                        clusters=processed_clusters
-                    )
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    "Mean of empty slice|invalid value encountered in scalar divide",
+                    RuntimeWarning,
+                    "numpy",
+                )
 
-                if settings.debug.visualize_layout:
-                    self.draw_clusters_and_cells_side_by_side(
-                        conv_res, page, processed_clusters, mode_prefix="postprocessed"
-                    )
+                conv_res.confidence.pages[page.page_no].layout_score = float(
+                    np.mean([c.confidence for c in processed_clusters])
+                )
 
-                yield page
+                conv_res.confidence.pages[page.page_no].ocr_score = float(
+                    np.mean([c.confidence for c in processed_cells if c.from_ocr])
+                )
+
+            page.predictions.layout = LayoutPrediction(clusters=processed_clusters)
+
+            if settings.debug.visualize_layout:
+                self.draw_clusters_and_cells_side_by_side(
+                    conv_res, page, processed_clusters, mode_prefix="postprocessed"
+                )
+
+            yield page
