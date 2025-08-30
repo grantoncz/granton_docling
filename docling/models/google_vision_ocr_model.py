@@ -16,11 +16,17 @@ from docling.datamodel.settings import settings
 from docling.models.base_ocr_model import BaseOcrModel
 from docling.utils.profiling import TimeRecorder
 
-# Google Cloud Vision API
-from google.cloud import vision
-from google.oauth2.service_account import Credentials
-from PIL import Image
+try:
+    # Google Cloud Vision API
+    from google.cloud import vision
+    from google.oauth2.service_account import Credentials
+except ImportError:
+    raise ImportError(
+        "Google Cloud Vision is not installed. Please install it via `pip install google-cloud-vision` to use this OCR engine."
+    )
+    
 import io
+import numpy as np
 
 _log = logging.getLogger(__name__)
 
@@ -47,22 +53,12 @@ class GoogleVisionOcrModel(BaseOcrModel):
         self.script_readers = {}
 
         if self.enabled:
-            install_errmsg = (
-                "Google Vision is not correctly installed. "
-                "Please install it via `pip install google` to use this OCR engine. "
-            )
-            missing_langs_errmsg = (
-                "Google Vision is not correctly configured. No language models have been detected. "
-                "You can find more information how to setup other OCR engines in Docling "
-                "documentation: "
-                "https://docling-project.github.io/docling/installation/"
-            )
-
             # Initialize the GoogleVisionOcr
             cred = Credentials.from_service_account_info(options.credentials)
-            self.reader = vision.ImageAnnotatorClient(credentials=cred)
+            self.reader:vision.ImageAnnotatorClient = vision.ImageAnnotatorClient(credentials=cred)
             _log.debug("Initializing GoogleVisionOCR: %s", str(self.reader))
             lang = "+".join(self.options.lang)
+            _log.debug("Google Vision OCR supported languages: %s", lang)
 
     def __del__(self):
         if self.reader is not None:
@@ -101,35 +97,54 @@ class GoogleVisionOcrModel(BaseOcrModel):
 
                         vision_image = vision.Image(content=image_bytes)
                         response = self.reader.document_text_detection(image=vision_image)
-
-                        annotations = response.text_annotations[1:]  # skip full block
-                        cells = []
-
-                        for ix, annotation in enumerate(annotations):
-                            vertices = annotation.bounding_poly.vertices
-                            x_vals = [v.x for v in vertices]
-                            y_vals = [v.y for v in vertices]
-
-                            left = min(x_vals) / self.scale
-                            top = min(y_vals) / self.scale
-                            right = max(x_vals) / self.scale
-                            bottom = max(y_vals) / self.scale
-
-                            cells.append(
-                                TextCell(
-                                    index=ix,
-                                    text=annotation.description,
-                                    orig=annotation.description,
-                                    from_ocr=True,
-                                    confidence=1.0,  # Google Vision doesn't expose per-word confidence
-                                    rect=BoundingRectangle.from_bounding_box(
-                                        BoundingBox.from_tuple(
-                                            coord=(left, top, right, bottom),
-                                            origin=CoordOrigin.TOPLEFT,
-                                        )
-                                    ),
-                                )
+                        if response.error.message:
+                            _log.error(
+                                "Google Vision OCR error: %s (code: %d)",
+                                response.error.message,
+                                response.error.code,
                             )
+                            continue
+                        
+                        if len(response.text_annotations) == 0:
+                            _log.error("Google Vision OCR returned no text annotations!")
+                            continue
+                        
+                        if len(response.full_text_annotation.pages) != 1:
+                            _log.warning("Google Vision OCR returned %d pages, expected 1", len(response.full_text_annotation.pages))
+
+                        cells = []
+                        ocr_page = response.full_text_annotation.pages[0]
+
+                        for block in ocr_page.blocks:
+                            for paragraph in block.paragraphs:
+                                for word in paragraph.words:
+                                    word_text = ''.join([symbol.text for symbol in word.symbols])
+                                    conf:float = float(np.mean([symbol.confidence for symbol in word.symbols]) if word.symbols else 100.0)
+
+                                    vertices = word.bounding_box.vertices
+                                    x_vals = [v.x for v in vertices]
+                                    y_vals = [v.y for v in vertices]
+
+                                    left = min(x_vals) / self.scale
+                                    top = min(y_vals) / self.scale
+                                    right = max(x_vals) / self.scale
+                                    bottom = max(y_vals) / self.scale
+
+                                    cells.append(
+                                        TextCell(
+                                            index=len(cells),
+                                            text=word_text,
+                                            orig=word_text,
+                                            from_ocr=True,
+                                            confidence=conf,
+                                            rect=BoundingRectangle.from_bounding_box(
+                                                BoundingBox.from_tuple(
+                                                    coord=(left, top, right, bottom),
+                                                    origin=CoordOrigin.TOPLEFT,
+                                                )
+                                            ),
+                                        )
+                                    )
 
                         all_ocr_cells.extend(cells)
 
