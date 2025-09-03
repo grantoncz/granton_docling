@@ -103,6 +103,10 @@ rapidocr = [
 asr = [
     "openai-whisper>=20250625",
 ]
+googleocr = [
+  "google-cloud-vision>=3.10.2,<4.0.0",
+  "google-auth>=2.40.3,<3.0.0"
+]
 
 [dependency-groups]
 dev = [
